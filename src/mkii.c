@@ -28,6 +28,7 @@
 #include "image.h"
 #include "device.h"
 #include "usb-device.h"
+#include "printf-utils.h"
 
 #define MKII_OUT	0x8810001B
 #define MKII_IN		0x8800101B
@@ -189,7 +190,7 @@ enum device mkii_get_device(struct usb_device_info * dev) {
 }
 
 int mkii_flash_image(struct usb_device_info * dev, struct image * image) {
-
+	ERROR("%s", usb_strerror());
 	char buf1[512];
 	char buf[2048];
 	struct mkii_message * msg1;
@@ -201,13 +202,14 @@ int mkii_flash_image(struct usb_device_info * dev, struct image * image) {
 	uint32_t size;
 	int ret;
 
-	ERROR("Not implemented yet");
-	return -1;
 
 	if ( ! ( dev->data & (1UL << image->type) ) ) {
 		ERROR("Flashing image %s is not supported in current device configuration", image_type_to_string(image->type));
 		return -1;
 	}
+
+	printf("Send and flash image:\n");
+	image_print_info(image);
 
 	msg = (struct mkii_message *)buf;
 	msg1 = (struct mkii_message *)buf1;
@@ -322,18 +324,91 @@ int mkii_flash_image(struct usb_device_info * dev, struct image * image) {
 	memcpy(ptr, "\x00", 1);
 	ptr += 1;
 
+	ret = mkii_send_receive(dev->udev, MKII_PING, msg, 0, msg, sizeof(buf));
+	if ( ret != 0 )
+		ERROR_RETURN("Cannot ping device", -1);
+
 	ret = mkii_send_receive(dev->udev, 0x03, msg1, 0, msg1, sizeof(buf1));
-	if ( ret != 1 || msg1->data[0] != 0 )
+	if ( ret != 1 || msg1->data[0] != 0 ) {
+		ERROR("Sending stuff failed; ret: %d", ret);
 		return -1;
+	}
 
 	ret = mkii_send_receive(dev->udev, 0x04, msg, ptr - msg->data, msg, sizeof(buf));
-	if ( ret != 9 )
+	if ( ret != 9 ) {
+		ERROR("Sending subimage header failed");
 		return -1;
+	}
 
-	/* TODO: send image itself */
+	/* tx type(?) */
+	len = 4 + 7;
+	memcpy(msg->data, "\0\0\0\0usb:raw", len);
+	ret = mkii_send_receive(dev->udev, 0x05, msg, len, msg, sizeof(buf));
+	if ( ret != 1 || msg1->data[0] != 0 ) {
+		ERROR("Sending tx type failed");
+		return -1;
+	}
 
-	return 0;
+	int rv = 0;
+	const unsigned data_buf_size = 1048576;
+	char *data_buf = malloc(data_buf_size);
+	unsigned sent = 0;
+	printf("Sending and flashing image...\n");
+	//printf_progressbar(0, image->size);
+	image_seek(image, 0);
+	while ( sent < image-> size ) {
+		len = 4;
+		memcpy(msg->data, "\0\0\0\0", len);
+		ret = mkii_send_receive(dev->udev, 0x06, msg, len, msg, sizeof(buf));
+		if ( ret != 21 || msg->type != 0x26 ) {
+			ERROR("Sending image chunk header0 failed");
+			rv = -1;
+			goto free_data_buf;
+		}
 
+		len = 4;
+		memcpy(msg->data, "\0\0\0@", len);
+		ret = mkii_send_receive(dev->udev, 0x0B, msg, len, msg, sizeof(buf));
+		if ( ret != 13 || msg->type != 0x2B ) {
+			ERROR("Sending image chunk header1 failed");
+			rv = -1;
+			goto free_data_buf;
+		}
+
+		len = 4;
+		memcpy(msg->data, "\0\0\0\0\0\x10\0\0", len);
+		ret = mkii_send_receive(dev->udev, 0x08, msg, len, msg, sizeof(buf));
+		if ( ret != 1 || msg->type != 0x28 ) {
+			ERROR("Sending image chunk header2 failed, ret: %d", ret);
+			rv = -1;
+			goto free_data_buf;
+		}
+
+		unsigned to_read = data_buf_size;
+		while (to_read) {
+			to_read -= image_read(image, data_buf, to_read);
+			if ( ret == 0 )
+				break;
+		}
+		int to_send = data_buf_size - to_read;
+		printf("s %d\n", to_send);
+		ret = usb_bulk_write(dev->udev, USB_WRITE_DATA_EP, data_buf, 4096, 5000);
+		if ( ret != to_send ) {
+			ERROR("Sending image failed, ret: %d", ret);
+			ERROR("%s", usb_strerror());
+			rv = -1;
+			goto free_data_buf;
+		}
+		sent += ret;
+		//printf_progressbar(sent, image->size);
+	}
+	printf("Sending image finished");
+
+free_data_buf:
+	free(data_buf);
+
+	exit(1);
+	return rv;
 }
 
 int mkii_reboot_device(struct usb_device_info * dev, int update) {
